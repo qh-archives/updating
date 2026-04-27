@@ -1,0 +1,937 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Citizen Backup Portal</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; font-family: 'Courier New', monospace; }
+  canvas { display: block; }
+  #eyescan-layer, #tunnel-layer, #complete-layer {
+    position: fixed; inset: 0; width: 100%; height: 100%;
+  }
+  #start-screen {
+    position: fixed; inset: 0; z-index: 200; background: #000;
+    display: flex; align-items: center; justify-content: center;
+    flex-direction: column; cursor: pointer;
+  }
+  #start-screen .title {
+    color: rgba(50,255,120,0.85); font-size: 18px; letter-spacing: 6px;
+    text-shadow: 0 0 30px rgba(50,255,120,0.3);
+    margin-bottom: 40px;
+  }
+  #start-screen .prompt {
+    color: rgba(50,255,120,0.5); font-size: 12px; letter-spacing: 4px;
+    animation: pulse 2s ease-in-out infinite;
+  }
+  #start-screen .border-box {
+    border: 1px solid rgba(50,255,120,0.2); padding: 60px 80px;
+    text-align: center;
+  }
+  #eyescan-layer { z-index: 50; }
+  #tunnel-layer { z-index: 20; display: none; }
+  #complete-layer { z-index: 60; display: none; }
+  #tunnel-layer canvas { position: fixed; inset: 0; }
+  #upload-text {
+    position: fixed; bottom: 40px; left: 0; right: 0; text-align: center;
+    z-index: 25; pointer-events: none;
+    font-size: 14px; letter-spacing: 8px; color: rgba(50,255,120,0.7);
+    text-shadow: 0 0 20px rgba(50,255,120,0.4);
+    animation: pulse 1.5s ease-in-out infinite;
+    display: none;
+  }
+  #glitch-canvas {
+    position: fixed; inset: 0; width: 100%; height: 100%;
+    z-index: 22; pointer-events: none; display: none;
+  }
+  @keyframes pulse { 0%,100%{opacity:0.6} 50%{opacity:1} }
+  video { display: none; }
+</style>
+</head>
+<body>
+
+<div id="start-screen">
+  <div class="border-box">
+    <div class="title">CITIZEN BACKUP PORTAL</div>
+    <div class="prompt">[ CLICK TO INITIALIZE ]</div>
+  </div>
+</div>
+
+<video id="webcam" autoplay playsinline muted></video>
+
+<div id="eyescan-layer" style="display:none">
+  <canvas id="eyescan-canvas"></canvas>
+</div>
+
+<div id="tunnel-layer">
+  <canvas id="glitch-canvas"></canvas>
+  <div id="upload-text">UPLOADING . . .</div>
+</div>
+
+<div id="complete-layer">
+  <canvas id="complete-canvas"></canvas>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.164.1/build/three.module.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+// ─── GLOBALS ───
+const G = [50, 255, 120];
+const MATRIX_CHARS = 'アイウエオカキクケコサシスセソタチツテト0123456789ABCDEFZ';
+let currentPhase = 'scan'; // scan | zooming | tunnel | complete
+
+// ─── EYE SCAN ───
+const eyeCanvas = document.getElementById('eyescan-canvas');
+const eyeCtx = eyeCanvas.getContext('2d');
+const vid = document.getElementById('webcam');
+const samplerCv = document.createElement('canvas');
+const samplerCtx = samplerCv.getContext('2d');
+
+const SCAN_DURATION = 8000;
+const ASCII_RAMP = " .'`^\",:;Il!i><~+_-?][}{1)(|/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$";
+const CELL = 10;
+const CROP = { cx: 0.48, cy: 0.32, size: 0.25 };
+
+let eyeW, eyeH, eyeT0, eyeAnimId;
+let eyePos = { x: 0.5, y: 0.45 };
+let rawEyePos = { x: 0.5, y: 0.45 };
+let lastDetect = 0;
+let faceLandmarker = null;
+let eyeScanStopped = false;
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+function resizeEye() {
+  eyeW = eyeCanvas.width = window.innerWidth;
+  eyeH = eyeCanvas.height = window.innerHeight;
+}
+
+async function initFace() {
+  try {
+    const { FaceLandmarker, FilesetResolver } = await import(
+      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm'
+    );
+    if (eyeScanStopped) return;
+    const vision = await FilesetResolver.forVisionTasks(
+      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
+    );
+    if (eyeScanStopped) return;
+    faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+        delegate: 'GPU',
+      },
+      runningMode: 'VIDEO',
+      numFaces: 1,
+    });
+    if (eyeScanStopped && faceLandmarker) {
+      faceLandmarker.close();
+      faceLandmarker = null;
+    }
+  } catch (e) { /* optional */ }
+}
+
+function detectEye(ts) {
+  if (!faceLandmarker || vid.readyState < 2 || ts - lastDetect < 100) return;
+  lastDetect = ts;
+  try {
+    const res = faceLandmarker.detectForVideo(vid, ts);
+    if (res.faceLandmarks?.length > 0) {
+      const lm = res.faceLandmarks[0];
+      const lx = (lm[468].x + lm[473].x) / 2;
+      const ly = (lm[468].y + lm[473].y) / 2;
+      const cropLeft = CROP.cx - CROP.size / 2;
+      const cropTop = CROP.cy - (CROP.size / 2) * (eyeH / eyeW);
+      const cropW = CROP.size;
+      const cropH = CROP.size * (eyeH / eyeW);
+      rawEyePos.x = Math.max(0.1, Math.min(0.9, (1 - lx - cropLeft) / cropW));
+      rawEyePos.y = Math.max(0.1, Math.min(0.9, (ly - cropTop) / cropH));
+    }
+  } catch (e) {}
+}
+
+function stopEyeScan() {
+  if (eyeScanStopped) return;
+  eyeScanStopped = true;
+  cancelAnimationFrame(eyeAnimId);
+  if (vid.srcObject) { vid.srcObject.getTracks().forEach(t => t.stop()); vid.srcObject = null; }
+  if (faceLandmarker) { faceLandmarker.close(); faceLandmarker = null; }
+}
+
+let eyeVerified = false;
+
+function drawEye() {
+  if (eyeScanStopped) return;
+  eyeAnimId = requestAnimationFrame(drawEye);
+  const el = Date.now() - eyeT0;
+  const prog = Math.min(el / SCAN_DURATION, 1);
+
+  eyePos.x = lerp(eyePos.x, rawEyePos.x, 0.1);
+  eyePos.y = lerp(eyePos.y, rawEyePos.y, 0.1);
+  detectEye(performance.now());
+
+  eyeCtx.fillStyle = '#000';
+  eyeCtx.fillRect(0, 0, eyeW, eyeH);
+
+  const cols = Math.floor(eyeW / CELL);
+  const rows = Math.floor(eyeH / CELL);
+
+  if (vid.readyState >= 2) {
+    const vw = vid.videoWidth, vh = vid.videoHeight;
+    const cropW = vw * CROP.size;
+    const cropH = cropW * (eyeH / eyeW);
+    const cropX = vw * CROP.cx - cropW / 2;
+    const cropY = vh * CROP.cy - cropH / 2;
+
+    samplerCv.width = cols; samplerCv.height = rows;
+    samplerCtx.save();
+    samplerCtx.translate(cols, 0);
+    samplerCtx.scale(-1, 1);
+    samplerCtx.drawImage(vid, cropX, cropY, cropW, cropH, 0, 0, cols, rows);
+    samplerCtx.restore();
+
+    const imgData = samplerCtx.getImageData(0, 0, cols, rows);
+    const px = imgData.data;
+    const revealRow = Math.floor(rows * Math.min(el / 2000, 1));
+
+    eyeCtx.font = `${CELL}px "Courier New", monospace`;
+    for (let r = 0; r < rows; r++) {
+      if (r > revealRow) continue;
+      for (let c = 0; c < cols; c++) {
+        const i = (r * cols + c) * 4;
+        const b = (px[i] * 0.299 + px[i+1] * 0.587 + px[i+2] * 0.114) / 255;
+        const ch = ASCII_RAMP[Math.floor(b * (ASCII_RAMP.length - 1))];
+        if (ch === ' ') continue;
+        eyeCtx.fillStyle = `rgba(${G[0]},${G[1]},${G[2]},${0.5 + b * 0.5})`;
+        eyeCtx.fillText(ch, c * CELL, r * CELL + CELL);
+      }
+    }
+  }
+
+  // Scanlines
+  eyeCtx.fillStyle = 'rgba(0,0,0,0.1)';
+  for (let y = 0; y < eyeH; y += 3) eyeCtx.fillRect(0, y, eyeW, 1);
+
+  // Vignette
+  const vg = eyeCtx.createRadialGradient(eyeW/2, eyeH/2, eyeW*0.2, eyeW/2, eyeH/2, eyeW*0.65);
+  vg.addColorStop(0, 'rgba(0,0,0,0)');
+  vg.addColorStop(1, 'rgba(0,0,0,0.65)');
+  eyeCtx.fillStyle = vg;
+  eyeCtx.fillRect(0, 0, eyeW, eyeH);
+
+  // Target
+  const tx = eyePos.x * eyeW, ty = eyePos.y * eyeH;
+
+  eyeCtx.save();
+  eyeCtx.translate(tx, ty);
+  eyeCtx.rotate(el * 0.0006);
+  eyeCtx.setLineDash([8, 10]);
+  eyeCtx.beginPath();
+  eyeCtx.arc(0, 0, 70, 0, Math.PI * 2);
+  eyeCtx.strokeStyle = `rgba(${G[0]},${G[1]},${G[2]},0.4)`;
+  eyeCtx.lineWidth = 2;
+  eyeCtx.stroke();
+  eyeCtx.setLineDash([]);
+  eyeCtx.restore();
+
+  eyeCtx.save();
+  eyeCtx.translate(tx, ty);
+  eyeCtx.rotate(-el * 0.001);
+  eyeCtx.setLineDash([4, 8]);
+  eyeCtx.beginPath();
+  eyeCtx.arc(0, 0, 45, 0, Math.PI * 2);
+  eyeCtx.strokeStyle = `rgba(${G[0]},${G[1]},${G[2]},0.3)`;
+  eyeCtx.lineWidth = 1.5;
+  eyeCtx.stroke();
+  eyeCtx.setLineDash([]);
+  eyeCtx.restore();
+
+  eyeCtx.strokeStyle = `rgba(${G[0]},${G[1]},${G[2]},0.5)`;
+  eyeCtx.lineWidth = 2;
+  eyeCtx.beginPath();
+  eyeCtx.moveTo(tx - 90, ty); eyeCtx.lineTo(tx - 15, ty);
+  eyeCtx.moveTo(tx + 15, ty); eyeCtx.lineTo(tx + 90, ty);
+  eyeCtx.moveTo(tx, ty - 90); eyeCtx.lineTo(tx, ty - 15);
+  eyeCtx.moveTo(tx, ty + 15); eyeCtx.lineTo(tx, ty + 90);
+  eyeCtx.stroke();
+
+  const bSz = 20, bOff = 55;
+  eyeCtx.strokeStyle = `rgba(${G[0]},${G[1]},${G[2]},0.45)`;
+  eyeCtx.lineWidth = 2;
+  [[tx-bOff, ty-bOff+bSz, tx-bOff, ty-bOff, tx-bOff+bSz, ty-bOff],
+   [tx+bOff-bSz, ty-bOff, tx+bOff, ty-bOff, tx+bOff, ty-bOff+bSz],
+   [tx-bOff, ty+bOff-bSz, tx-bOff, ty+bOff, tx-bOff+bSz, ty+bOff],
+   [tx+bOff-bSz, ty+bOff, tx+bOff, ty+bOff, tx+bOff, ty+bOff-bSz]].forEach(pts => {
+    eyeCtx.beginPath();
+    eyeCtx.moveTo(pts[0], pts[1]); eyeCtx.lineTo(pts[2], pts[3]); eyeCtx.lineTo(pts[4], pts[5]);
+    eyeCtx.stroke();
+  });
+
+  const dotAlpha = 0.5 + Math.sin(el * 0.006) * 0.3;
+  eyeCtx.fillStyle = `rgba(${G[0]},${G[1]},${G[2]},${dotAlpha})`;
+  eyeCtx.fillRect(tx - 3, ty - 3, 6, 6);
+
+  // Scanning words
+  const words = [
+    { text: '>> SCANNING IRIS <<', ox: 0, oy: 95, align: 'center', delay: 0, size: 14, bold: true },
+    { text: 'RETINAL PATTERN', ox: 85, oy: -50, align: 'left', delay: 400 },
+    { text: 'VASCULATURE MAP', ox: 85, oy: -35, align: 'left', delay: 900 },
+    { text: 'IRIS LOCK: ACTIVE', ox: 85, oy: -20, align: 'left', delay: 1400 },
+    { text: 'DEPTH: ' + (2.1 + Math.sin(el * 0.003) * 0.4).toFixed(1) + 'mm', ox: 85, oy: 30, align: 'left', delay: 2000 },
+    { text: 'PUPIL: TRACKING', ox: 85, oy: 45, align: 'left', delay: 2500 },
+    { text: 'BIOMETRIC HASH', ox: -85, oy: -50, align: 'right', delay: 600 },
+    { text: 'NEURAL SIGNATURE', ox: -85, oy: -35, align: 'right', delay: 1100 },
+    { text: 'CONSCIOUSNESS: ' + Math.floor(prog * 100) + '%', ox: -85, oy: -20, align: 'right', delay: 1800 },
+    { text: 'LAYER ' + Math.min(Math.floor(prog * 5) + 1, 5) + '/5', ox: -85, oy: 30, align: 'right', delay: 2200 },
+    { text: prog > 0.7 ? 'MATCH: CONFIRMED' : 'ACQUIRING...', ox: -85, oy: 45, align: 'right', delay: 3000 },
+  ];
+
+  words.forEach(w => {
+    if (el < w.delay) return;
+    const fadeIn = Math.min((el - w.delay) / 600, 1);
+    if (Math.sin(el * 0.008 + w.delay) <= -0.85) return;
+    eyeCtx.font = w.bold ? `bold ${w.size||11}px "Courier New", monospace` : `${w.size||11}px "Courier New", monospace`;
+    eyeCtx.textAlign = w.align;
+    eyeCtx.fillStyle = `rgba(${G[0]},${G[1]},${G[2]},${fadeIn * (w.bold ? 0.8 : 0.5)})`;
+    eyeCtx.fillText(w.text, tx + w.ox, ty + w.oy);
+  });
+  eyeCtx.textAlign = 'left';
+
+  // Loading bar
+  const barW = 160, barH = 3, barX = tx - barW/2, barY = ty + 112;
+  eyeCtx.fillStyle = `rgba(${G[0]},${G[1]},${G[2]},0.1)`;
+  eyeCtx.fillRect(barX, barY, barW, barH);
+  eyeCtx.fillStyle = `rgba(${G[0]},${G[1]},${G[2]},0.6)`;
+  eyeCtx.fillRect(barX, barY, barW * prog, barH);
+  eyeCtx.font = '9px "Courier New", monospace';
+  eyeCtx.textAlign = 'center';
+  eyeCtx.fillStyle = `rgba(${G[0]},${G[1]},${G[2]},0.35)`;
+  eyeCtx.fillText(Math.floor(prog * 100) + '%', tx, barY + 14);
+  eyeCtx.textAlign = 'left';
+
+  // Top bar
+  eyeCtx.fillStyle = `rgba(${G[0]},${G[1]},${G[2]},0.85)`;
+  eyeCtx.fillRect(0, 0, eyeW, 16);
+  eyeCtx.fillStyle = '#000';
+  eyeCtx.font = '11px "Courier New", monospace';
+  eyeCtx.fillText(' CITIZEN BACKUP PORTAL — EYE VERIFICATION', 4, 12);
+
+  // REC blink
+  if (Math.floor(el / 500) % 2 === 0) {
+    eyeCtx.fillStyle = 'rgba(255,50,50,0.8)';
+    eyeCtx.fillRect(eyeW - 55, 25, 6, 6);
+    eyeCtx.fillStyle = `rgba(${G[0]},${G[1]},${G[2]},0.6)`;
+    eyeCtx.font = '9px "Courier New", monospace';
+    eyeCtx.fillText('REC', eyeW - 45, 32);
+  }
+
+  if (prog >= 1 && !eyeVerified) {
+    eyeVerified = true;
+    stopEyeScan();
+    setTimeout(startZoomTransition, 1200);
+  }
+}
+
+// ─── ZOOM TRANSITION ───
+function startZoomTransition() {
+  currentPhase = 'zooming';
+  const layer = document.getElementById('eyescan-layer');
+  layer.style.transition = 'transform 2s cubic-bezier(0.4,0,0,1), opacity 2s ease-in';
+  layer.style.transform = 'scale(8)';
+  layer.style.opacity = '0';
+  layer.style.transformOrigin = '50% 45%';
+  layer.style.pointerEvents = 'none';
+
+  // Start tunnel immediately
+  startTunnel();
+
+  setTimeout(() => {
+    layer.style.display = 'none';
+    currentPhase = 'tunnel';
+  }, 2200);
+}
+
+// ─── THREE.JS TUNNEL ───
+let tunnelAnimId;
+
+function loadImageTextures(count) {
+  const loader = new THREE.TextureLoader();
+  loader.crossOrigin = 'anonymous';
+  const textures = [];
+  for (let i = 0; i < count; i++) {
+    const tex = loader.load(`https://picsum.photos/200/150?random=${i + 1}`);
+    tex.minFilter = THREE.LinearFilter;
+    tex.generateMipmaps = false;
+    textures.push(tex);
+  }
+  return textures;
+}
+
+function makeBinaryTexture(idx) {
+  const cv = document.createElement('canvas');
+  cv.width = 64; cv.height = 128;
+  const c = cv.getContext('2d');
+  c.fillStyle = 'rgba(0,0,0,0)';
+  c.clearRect(0, 0, 64, 128);
+
+  const chars = '01';
+  const matChars = 'アイウエオカキクケコ';
+  c.font = '10px "Courier New", monospace';
+  const brightness = 0.4 + Math.random() * 0.6;
+
+  for (let row = 0; row < 12; row++) {
+    const useMatrix = Math.random() < 0.3;
+    const ch = useMatrix
+      ? matChars[Math.floor(Math.random() * matChars.length)]
+      : chars[Math.floor(Math.random() * 2)] + chars[Math.floor(Math.random() * 2)] + chars[Math.floor(Math.random() * 2)] + chars[Math.floor(Math.random() * 2)];
+    const alpha = brightness * (0.3 + Math.random() * 0.7);
+    c.fillStyle = `rgba(50, 255, 120, ${alpha})`;
+    c.fillText(ch, 2 + Math.random() * 10, 12 + row * 10);
+  }
+
+  const tex = new THREE.CanvasTexture(cv);
+  tex.minFilter = THREE.LinearFilter;
+  tex.generateMipmaps = false;
+  return tex;
+}
+
+function makeRingGeometry(radius, segments) {
+  const points = [];
+  for (let i = 0; i <= segments; i++) {
+    const a = (i / segments) * Math.PI * 2;
+    points.push(new THREE.Vector3(Math.cos(a) * radius, 0, Math.sin(a) * radius));
+  }
+  const g = new THREE.BufferGeometry().setFromPoints(points);
+  return g;
+}
+
+function startTunnel() {
+  const tunnelLayer = document.getElementById('tunnel-layer');
+  tunnelLayer.style.display = 'block';
+  document.getElementById('upload-text').style.display = 'block';
+
+  // Looping noise audio — AudioContext was unlocked by the start screen click
+  const noiseAudio = new Audio('noise.mp3');
+  noiseAudio.loop = true;
+  noiseAudio.volume = 0.5;
+  if (audioCtx) audioCtx.resume().then(() => noiseAudio.play().catch(() => {}));
+  else noiseAudio.play().catch(() => {});
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x010201);
+  scene.fog = new THREE.Fog(0x010201, 40, 260);
+
+  const camera = new THREE.PerspectiveCamera(100, window.innerWidth / window.innerHeight, 1, 400);
+  camera.position.set(0, 0, 0);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  tunnelLayer.insertBefore(renderer.domElement, tunnelLayer.firstChild);
+
+  const RADIUS = 42;
+  const TOTAL_HEIGHT = 800;
+  const MAT_COUNT = 24;
+  const PANELS_PER_MAT = 12;
+  const BASE_SPEED = 80;
+  const DURATION = 20000;
+  const BREAKDOWN_START = 12;
+
+  // ── Image panels ──
+  const textures = loadImageTextures(MAT_COUNT);
+  const materials = [];
+  for (let i = 0; i < MAT_COUNT; i++) {
+    materials.push(new THREE.MeshBasicMaterial({
+      map: textures[i],
+      side: THREE.FrontSide,
+    }));
+  }
+
+  const geo = new THREE.PlaneGeometry(7, 5);
+  for (let m = 0; m < MAT_COUNT; m++) {
+    for (let p = 0; p < PANELS_PER_MAT; p++) {
+      const angle = Math.random() * Math.PI * 2;
+      const y = Math.random() * TOTAL_HEIGHT;
+      const r = RADIUS + (Math.random() - 0.5) * 12;
+      const mesh = new THREE.Mesh(geo, materials[m]);
+      mesh.position.set(Math.cos(angle) * r, y, Math.sin(angle) * r);
+      mesh.lookAt(0, y, 0);
+      const s = 0.6 + Math.random() * 0.8;
+      mesh.scale.set(s, s, 1);
+      scene.add(mesh);
+    }
+  }
+
+  // ── Floating binary/matrix text sprites ──
+  const BINARY_COUNT = 120;
+  const binaryTexCount = 8;
+  const binaryTextures = [];
+  const binaryMaterials = [];
+  for (let i = 0; i < binaryTexCount; i++) {
+    const t = makeBinaryTexture(i);
+    binaryTextures.push(t);
+    binaryMaterials.push(new THREE.SpriteMaterial({
+      map: t,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    }));
+  }
+
+  const binarySprites = [];
+  for (let i = 0; i < BINARY_COUNT; i++) {
+    const sprite = new THREE.Sprite(binaryMaterials[i % binaryTexCount]);
+    const angle = Math.random() * Math.PI * 2;
+    const r = 8 + Math.random() * (RADIUS + 10);
+    const y = Math.random() * TOTAL_HEIGHT;
+    sprite.position.set(Math.cos(angle) * r, y, Math.sin(angle) * r);
+    const s = 1.5 + Math.random() * 3;
+    sprite.scale.set(s, s * 2, 1);
+    sprite.userData = { drift: (Math.random() - 0.5) * 0.3, baseR: r, angle, rotSpeed: (Math.random() - 0.5) * 0.15 };
+    scene.add(sprite);
+    binarySprites.push(sprite);
+  }
+
+  // ── Glowing green wireframe rings ──
+  const RING_COUNT = 30;
+  const ringGeo = makeRingGeometry(RADIUS + 2, 48);
+  const ringMat = new THREE.LineBasicMaterial({ color: 0x32ff78, transparent: true, opacity: 0.12 });
+  for (let i = 0; i < RING_COUNT; i++) {
+    const ring = new THREE.LineLoop(ringGeo, ringMat);
+    ring.position.y = (i / RING_COUNT) * TOTAL_HEIGHT;
+    ring.rotation.x = Math.PI / 2;
+    scene.add(ring);
+  }
+
+  // ── Thin inner data streams (vertical lines of light) ──
+  const STREAM_COUNT = 16;
+  const streamMat = new THREE.LineBasicMaterial({ color: 0x32ff78, transparent: true, opacity: 0.08 });
+  for (let i = 0; i < STREAM_COUNT; i++) {
+    const a = (i / STREAM_COUNT) * Math.PI * 2;
+    const r = RADIUS - 5;
+    const pts = [
+      new THREE.Vector3(Math.cos(a) * r, 0, Math.sin(a) * r),
+      new THREE.Vector3(Math.cos(a) * r, TOTAL_HEIGHT, Math.sin(a) * r),
+    ];
+    const streamGeo = new THREE.BufferGeometry().setFromPoints(pts);
+    const line = new THREE.Line(streamGeo, streamMat);
+    scene.add(line);
+  }
+
+  // ── Glitch overlay canvas ──
+  const glitchCv = document.getElementById('glitch-canvas');
+  const glitchCtx = glitchCv.getContext('2d');
+  glitchCv.style.display = 'block';
+
+  let glitchW, glitchH;
+  function resizeGlitch() {
+    glitchW = glitchCv.width = window.innerWidth;
+    glitchH = glitchCv.height = window.innerHeight;
+  }
+  resizeGlitch();
+
+  let nextGlitch = 0;
+  let glitchActive = false;
+  let glitchEnd = 0;
+  let glitchType = 0;
+
+  const GLITCH_WORDS = [
+    'ERROR 0x4F2A', 'CORRUPTION DETECTED', 'BUFFER OVERFLOW',
+    'PACKET LOSS: 12.7%', 'SIGNAL DEGRADED', 'RECALIBRATING...',
+    'WARNING: DATA INTEGRITY', 'SECTOR 7-G UNSTABLE',
+    'MEMORY FAULT', 'RESYNCING NEURAL MAP', 'CHECKSUM MISMATCH',
+    'IDENTITY FRAGMENTED', '>>> OVERRIDE <<<', 'CONSCIOUSNESS LEAK',
+    'CRITICAL FAILURE', 'SYSTEM UNSTABLE', 'ABORT? Y/N',
+    'BACKUP CORRUPTED', 'TIMELINE FRACTURE', 'REALITY DESYNC',
+  ];
+
+  function getBreakdownIntensity(elapsed) {
+    if (elapsed < BREAKDOWN_START) return 0;
+    return Math.min((elapsed - BREAKDOWN_START) / (DURATION / 1000 - BREAKDOWN_START), 1);
+  }
+
+  function drawGlitch(elapsed) {
+    glitchCtx.clearRect(0, 0, glitchW, glitchH);
+
+    const breakdown = getBreakdownIntensity(elapsed);
+
+    // Glitch frequency increases as tunnel breaks down
+    const glitchInterval = breakdown > 0
+      ? Math.max(0.05, 0.4 - breakdown * 0.38)
+      : 0.4 + Math.random() * 2.5;
+
+    if (elapsed > nextGlitch && !glitchActive) {
+      glitchActive = true;
+      glitchType = Math.floor(Math.random() * 5);
+      const glitchDur = breakdown > 0
+        ? 0.05 + breakdown * 0.3
+        : 0.05 + Math.random() * 0.2;
+      glitchEnd = elapsed + glitchDur;
+      nextGlitch = elapsed + glitchInterval;
+    }
+
+    if (glitchActive && elapsed < glitchEnd) {
+      const intensity = Math.random() + breakdown * 0.5;
+
+      // Type 0: Horizontal screen tears — more and wider during breakdown
+      if (glitchType === 0 || glitchType === 4) {
+        const tearCount = 2 + Math.floor((Math.random() + breakdown * 3) * 6);
+        for (let i = 0; i < tearCount; i++) {
+          const ty = Math.floor(Math.random() * glitchH);
+          const th = 1 + Math.floor(Math.random() * (8 + breakdown * 30));
+          const shift = (Math.random() - 0.5) * (60 + breakdown * 200);
+          glitchCtx.drawImage(renderer.domElement, 0, ty, glitchW, th, shift, ty, glitchW, th);
+        }
+      }
+
+      // Type 1: RGB channel split — wider split during breakdown
+      if (glitchType === 1 || glitchType === 4) {
+        const shift = 3 + Math.floor(intensity * 12) + Math.floor(breakdown * 30);
+        glitchCtx.globalCompositeOperation = 'lighter';
+        glitchCtx.globalAlpha = 0.15 + intensity * 0.15;
+        glitchCtx.drawImage(renderer.domElement, shift, 0);
+        glitchCtx.globalAlpha = 0.1 + intensity * 0.1;
+        glitchCtx.drawImage(renderer.domElement, -shift, 0);
+        glitchCtx.globalCompositeOperation = 'source-over';
+        glitchCtx.globalAlpha = 1;
+      }
+
+      // Type 2: Static noise bars — heavier during breakdown
+      if (glitchType === 2) {
+        const barCount = 3 + Math.floor((Math.random() + breakdown * 2) * 5);
+        for (let i = 0; i < barCount; i++) {
+          const by = Math.floor(Math.random() * glitchH);
+          const bh = 2 + Math.floor(Math.random() * (20 + breakdown * 60));
+          for (let x = 0; x < glitchW; x += 2) {
+            const v = Math.floor(Math.random() * (60 + breakdown * 160));
+            glitchCtx.fillStyle = `rgba(${v + 20}, ${v + 40}, ${v + 20}, ${0.3 + Math.random() * 0.4})`;
+            glitchCtx.fillRect(x, by, 2, bh);
+          }
+        }
+      }
+
+      // Type 3: Flash + error text — bigger text, more words during breakdown
+      if (glitchType === 3) {
+        glitchCtx.fillStyle = `rgba(50, 255, 120, ${0.03 + intensity * 0.06 + breakdown * 0.1})`;
+        glitchCtx.fillRect(0, 0, glitchW, glitchH);
+
+        const wordCount = 1 + Math.floor(breakdown * 5);
+        for (let w = 0; w < wordCount; w++) {
+          const word = GLITCH_WORDS[Math.floor(Math.random() * GLITCH_WORDS.length)];
+          const tx = Math.random() * glitchW;
+          const ty = Math.random() * glitchH;
+          glitchCtx.font = `bold ${12 + Math.floor(Math.random() * (16 + breakdown * 30))}px "Courier New", monospace`;
+          glitchCtx.fillStyle = `rgba(50, 255, 120, ${0.4 + Math.random() * 0.5})`;
+          glitchCtx.fillText(word, tx, ty);
+        }
+      }
+
+      // Scanline flicker
+      if (Math.random() < 0.5 + breakdown * 0.5) {
+        glitchCtx.fillStyle = `rgba(0,0,0,${0.15 + breakdown * 0.2})`;
+        for (let y = 0; y < glitchH; y += 2) {
+          if (Math.random() < 0.5) glitchCtx.fillRect(0, y, glitchW, 1);
+        }
+      }
+
+    } else if (elapsed >= glitchEnd) {
+      glitchActive = false;
+    }
+
+    // ── WHITE FLASHES — increase in frequency and intensity during breakdown ──
+    if (breakdown > 0) {
+      const flashChance = breakdown * 0.15;
+      if (Math.random() < flashChance) {
+        const flashAlpha = 0.1 + breakdown * Math.random() * 0.7;
+        glitchCtx.fillStyle = `rgba(255, 255, 255, ${flashAlpha})`;
+        glitchCtx.fillRect(0, 0, glitchW, glitchH);
+      }
+
+      // Horizontal white bands
+      if (Math.random() < breakdown * 0.08) {
+        const bandCount = 1 + Math.floor(breakdown * 4);
+        for (let i = 0; i < bandCount; i++) {
+          const by = Math.floor(Math.random() * glitchH);
+          const bh = 2 + Math.floor(Math.random() * 40 * breakdown);
+          glitchCtx.fillStyle = `rgba(255, 255, 255, ${0.3 + Math.random() * 0.5})`;
+          glitchCtx.fillRect(0, by, glitchW, bh);
+        }
+      }
+    }
+
+    // ── FINAL WHITEOUT — last 1.5 seconds the screen bleaches to white ──
+    const timeLeft = DURATION / 1000 - elapsed;
+    if (timeLeft < 1.5) {
+      const whiteout = 1 - (timeLeft / 1.5);
+      glitchCtx.fillStyle = `rgba(255, 255, 255, ${whiteout * whiteout})`;
+      glitchCtx.fillRect(0, 0, glitchW, glitchH);
+    }
+
+    // Persistent subtle scanlines
+    glitchCtx.fillStyle = 'rgba(0,0,0,0.04)';
+    for (let y = 0; y < glitchH; y += 3) glitchCtx.fillRect(0, y, glitchW, 1);
+
+    // Occasional green tint flash
+    if (Math.random() < 0.003 + breakdown * 0.02) {
+      glitchCtx.fillStyle = `rgba(50, 255, 120, ${0.04 + breakdown * 0.08})`;
+      glitchCtx.fillRect(0, 0, glitchW, glitchH);
+    }
+  }
+
+  const onResize = () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    resizeGlitch();
+  };
+  window.addEventListener('resize', onResize);
+
+  const startTime = performance.now();
+  let lastFrame = performance.now();
+  let done = false;
+
+  function animate(now) {
+    tunnelAnimId = requestAnimationFrame(animate);
+
+    const dt = (now - lastFrame) / 1000;
+    lastFrame = now;
+    const elapsed = (now - startTime) / 1000;
+
+    const breakdown = getBreakdownIntensity(elapsed);
+
+    // Speed increases during breakdown — tunnel accelerates like losing control
+    const speed = BASE_SPEED + breakdown * 160;
+
+    camera.position.y += speed * dt;
+    if (camera.position.y > TOTAL_HEIGHT) camera.position.y = 0;
+
+    // Camera shake during breakdown
+    const shakeX = breakdown > 0 ? (Math.random() - 0.5) * breakdown * 6 : 0;
+    const shakeZ = breakdown > 0 ? (Math.random() - 0.5) * breakdown * 6 : 0;
+    camera.position.x = shakeX;
+    camera.position.z = shakeZ;
+    camera.lookAt(shakeX * 0.3, camera.position.y + 20, shakeZ * 0.3);
+
+    // FOV widens as tunnel breaks — feels like being pulled apart
+    camera.fov = 100 + breakdown * 30;
+    camera.updateProjectionMatrix();
+
+    // Animate binary sprites — slow drift rotation
+    for (let i = 0; i < binarySprites.length; i++) {
+      const sp = binarySprites[i];
+      const ud = sp.userData;
+      ud.angle += ud.rotSpeed * dt;
+      sp.position.x = Math.cos(ud.angle) * ud.baseR;
+      sp.position.z = Math.sin(ud.angle) * ud.baseR;
+    }
+
+    renderer.render(scene, camera);
+
+    // Glitch overlay
+    drawGlitch(elapsed);
+
+    if (now - startTime >= DURATION && !done) {
+      done = true;
+      cancelAnimationFrame(tunnelAnimId);
+
+      noiseAudio.pause();
+      noiseAudio.src = '';
+      renderer.dispose();
+      geo.dispose();
+      ringGeo.dispose();
+      textures.forEach(t => t.dispose());
+      materials.forEach(m => m.dispose());
+      binaryTextures.forEach(t => t.dispose());
+      binaryMaterials.forEach(m => m.dispose());
+      glitchCv.style.display = 'none';
+      window.removeEventListener('resize', onResize);
+      if (tunnelLayer.contains(renderer.domElement)) {
+        tunnelLayer.removeChild(renderer.domElement);
+      }
+
+      document.getElementById('upload-text').style.display = 'none';
+      startCompleteScreen();
+    }
+  }
+
+  tunnelAnimId = requestAnimationFrame(animate);
+}
+
+// ─── COMPLETE SCREEN ───
+function startCompleteScreen() {
+  currentPhase = 'complete';
+  document.getElementById('tunnel-layer').style.display = 'none';
+
+  const completeLayer = document.getElementById('complete-layer');
+  completeLayer.style.display = 'block';
+
+  const cv = document.getElementById('complete-canvas');
+  const ctx = cv.getContext('2d');
+  let W, H, animId;
+  const t0 = Date.now();
+
+  const drops = [];
+
+  function resize() {
+    W = cv.width = window.innerWidth;
+    H = cv.height = window.innerHeight;
+    const colW = 14;
+    drops.length = 0;
+    for (let i = 0; i < Math.floor(W / colW); i++) {
+      drops.push({
+        x: i * colW,
+        y: Math.random() * H,
+        speed: 80 + Math.random() * 200,
+        chars: [],
+      });
+      const len = 5 + Math.floor(Math.random() * 15);
+      for (let c = 0; c < len; c++) {
+        drops[i].chars.push(MATRIX_CHARS[Math.floor(Math.random() * MATRIX_CHARS.length)]);
+      }
+    }
+  }
+
+  const lines = [
+    { text: 'CITIZEN BACKUP PORTAL v2.7.1', delay: 500, y: -80 },
+    { text: '─────────────────────────────', delay: 700, y: -60 },
+    { text: '', delay: 900, y: -45 },
+    { text: 'UPDATE COMPLETED', delay: 1200, y: -20, big: true },
+    { text: '', delay: 1500, y: 0 },
+    { text: 'ALL 5 LAYERS CAPTURED SUCCESSFULLY', delay: 2000, y: 20 },
+    { text: 'BIOMETRIC ✓  NEURAL ✓  GENOMIC ✓', delay: 2500, y: 40 },
+    { text: 'BEHAVIORAL ✓  CONSCIOUSNESS ✓', delay: 2800, y: 55 },
+    { text: '', delay: 3000, y: 70 },
+    { text: 'NEXT BACKUP: TUESDAY 3:00 AM', delay: 3500, y: 90 },
+    { text: '100% — VERIFIED', delay: 4000, y: 110 },
+  ];
+
+  function draw() {
+    animId = requestAnimationFrame(draw);
+    const el = Date.now() - t0;
+
+    ctx.fillStyle = 'rgba(0, 4, 0, 0.15)';
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.font = '12px "Courier New", monospace';
+    drops.forEach(d => {
+      d.y += d.speed * (1 / 60);
+      if (d.y > H + 200) d.y = -100;
+      d.chars.forEach((ch, ci) => {
+        const cy = d.y - ci * 16;
+        if (cy < -20 || cy > H + 20) return;
+        const alpha = ci === 0 ? 0.9 : Math.max(0.02, 0.3 - ci * 0.02);
+        ctx.fillStyle = ci === 0
+          ? `rgba(200, 255, 220, ${alpha})`
+          : `rgba(${G[0]},${G[1]},${G[2]},${alpha})`;
+        ctx.fillText(ch, d.x, cy);
+      });
+      if (Math.random() < 0.03) {
+        const ri = Math.floor(Math.random() * d.chars.length);
+        d.chars[ri] = MATRIX_CHARS[Math.floor(Math.random() * MATRIX_CHARS.length)];
+      }
+    });
+
+    const grd = ctx.createRadialGradient(W/2, H/2, 0, W/2, H/2, W * 0.4);
+    grd.addColorStop(0, 'rgba(0, 4, 0, 0.85)');
+    grd.addColorStop(1, 'rgba(0, 4, 0, 0)');
+    ctx.fillStyle = grd;
+    ctx.fillRect(0, 0, W, H);
+
+    const cx = W / 2, cy = H / 2;
+    lines.forEach(line => {
+      if (el < line.delay || !line.text) return;
+      const charReveal = Math.min(Math.floor((el - line.delay) / 40), line.text.length);
+      const displayed = line.text.slice(0, charReveal);
+
+      if (line.big) {
+        ctx.font = 'bold 24px "Courier New", monospace';
+        ctx.textAlign = 'center';
+        ctx.fillStyle = `rgba(${G[0]},${G[1]},${G[2]},0.95)`;
+        ctx.shadowColor = `rgba(${G[0]},${G[1]},${G[2]},0.6)`;
+        ctx.shadowBlur = 20;
+        ctx.fillText(displayed, cx, cy + line.y);
+        ctx.shadowBlur = 0;
+      } else {
+        ctx.font = '12px "Courier New", monospace';
+        ctx.textAlign = 'center';
+        ctx.fillStyle = `rgba(${G[0]},${G[1]},${G[2]},0.55)`;
+        ctx.fillText(displayed, cx, cy + line.y);
+      }
+
+      if (charReveal < line.text.length && Math.floor(el / 300) % 2 === 0) {
+        const cursorX = cx + ctx.measureText(displayed).width / 2 + 2;
+        ctx.fillStyle = `rgba(${G[0]},${G[1]},${G[2]},0.8)`;
+        ctx.fillRect(cursorX, cy + line.y - 10, 8, 14);
+      }
+    });
+    ctx.textAlign = 'left';
+
+    ctx.fillStyle = 'rgba(0,0,0,0.06)';
+    for (let y = 0; y < H; y += 3) ctx.fillRect(0, y, W, 1);
+
+    ctx.fillStyle = `rgba(${G[0]},${G[1]},${G[2]},0.85)`;
+    ctx.fillRect(0, 0, W, 16);
+    ctx.fillStyle = '#000';
+    ctx.font = '11px "Courier New", monospace';
+    ctx.fillText(' CITIZEN BACKUP PORTAL — SESSION COMPLETE', 4, 12);
+
+    ctx.fillStyle = `rgba(${G[0]},${G[1]},${G[2]},0.6)`;
+    ctx.fillRect(0, H - 16, W, 16);
+    ctx.fillStyle = '#000';
+    ctx.font = '10px "Courier New", monospace';
+    ctx.fillText(' [ESC] Exit', 4, H - 4);
+  }
+
+  resize();
+  window.addEventListener('resize', resize);
+  draw();
+}
+
+// ─── INIT ───
+resizeEye();
+window.addEventListener('resize', resizeEye);
+
+// Unlock audio on first click, then start eye scan
+let audioCtx = null;
+document.getElementById('start-screen').addEventListener('click', () => {
+  // Unlock audio for later playback
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  audioCtx.resume();
+  // Warm up audio pipeline with a silent buffer
+  const buf = audioCtx.createBuffer(1, 1, 22050);
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(audioCtx.destination);
+  src.start();
+
+  document.getElementById('start-screen').style.display = 'none';
+  document.getElementById('eyescan-layer').style.display = 'block';
+
+  navigator.mediaDevices.getUserMedia({
+    video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }
+  }).then(stream => {
+    if (eyeScanStopped) { stream.getTracks().forEach(t => t.stop()); return; }
+    vid.srcObject = stream;
+    vid.onloadedmetadata = () => {
+      vid.play();
+      eyeT0 = Date.now();
+      drawEye();
+      initFace();
+    };
+  }).catch(() => {
+    eyeT0 = Date.now();
+    drawEye();
+  });
+});
+</script>
+</body>
+</html>
