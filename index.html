@@ -159,12 +159,15 @@ function detectEye(ts) {
   } catch (e) {}
 }
 
+let eyescanAudioRef = null;
+
 function stopEyeScan() {
   if (eyeScanStopped) return;
   eyeScanStopped = true;
   cancelAnimationFrame(eyeAnimId);
   if (vid.srcObject) { vid.srcObject.getTracks().forEach(t => t.stop()); vid.srcObject = null; }
   if (faceLandmarker) { faceLandmarker.close(); faceLandmarker = null; }
+  if (eyescanAudioRef) { eyescanAudioRef.pause(); eyescanAudioRef.src = ''; }
 }
 
 let eyeVerified = false;
@@ -950,6 +953,12 @@ document.getElementById('start-screen').addEventListener('click', () => {
 
   document.getElementById('start-screen').style.display = 'none';
   document.getElementById('eyescan-layer').style.display = 'block';
+
+  // Eye scan ambient audio — loops during scan
+  eyescanAudioRef = new Audio('eyescan.mp3');
+  eyescanAudioRef.loop = true;
+  eyescanAudioRef.volume = 0.6;
+  eyescanAudioRef.play().catch(() => {});
 
   navigator.mediaDevices.getUserMedia({
     video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }
