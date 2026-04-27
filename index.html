@@ -799,6 +799,10 @@ function startCompleteScreen() {
   currentPhase = 'complete';
   document.getElementById('tunnel-layer').style.display = 'none';
 
+  const endAudio = new Audio('uploaded.m4a');
+  endAudio.volume = 0.7;
+  endAudio.play().catch(() => {});
+
   const completeLayer = document.getElementById('complete-layer');
   completeLayer.style.display = 'block';
 
