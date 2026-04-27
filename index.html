@@ -935,9 +935,12 @@ window.addEventListener('resize', resizeEye);
 // Unlock audio on first click, then start eye scan
 let audioCtx = null;
 document.getElementById('start-screen').addEventListener('click', () => {
-  // Unlock audio for later playback
+  // Unlock audio and play click sound
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   audioCtx.resume();
+  const clickSfx = new Audio('click.mp3');
+  clickSfx.volume = 0.8;
+  clickSfx.play().catch(() => {});
   // Warm up audio pipeline with a silent buffer
   const buf = audioCtx.createBuffer(1, 1, 22050);
   const src = audioCtx.createBufferSource();
