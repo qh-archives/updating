@@ -419,12 +419,18 @@ function startTunnel() {
   tunnelLayer.style.display = 'block';
   document.getElementById('upload-text').style.display = 'block';
 
-  // Looping noise audio — AudioContext was unlocked by the start screen click
+  // Looping noise audio
   const noiseAudio = new Audio('noise.mp3');
   noiseAudio.loop = true;
   noiseAudio.volume = 0.5;
   if (audioCtx) audioCtx.resume().then(() => noiseAudio.play().catch(() => {}));
   else noiseAudio.play().catch(() => {});
+
+  // Glitch SFX — triggers at breakdown, loops and gets louder
+  const glitchAudio = new Audio('glitch.mp3');
+  glitchAudio.loop = true;
+  glitchAudio.volume = 0;
+  let glitchStarted = false;
 
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x010201);
@@ -443,8 +449,8 @@ function startTunnel() {
   const MAT_COUNT = 24;
   const PANELS_PER_MAT = 12;
   const BASE_SPEED = 80;
-  const DURATION = 20000;
-  const BREAKDOWN_START = 12;
+  const DURATION = 30000;
+  const BREAKDOWN_START = 20;
 
   // ── Image panels ──
   const textures = loadImageTextures(MAT_COUNT);
@@ -708,22 +714,42 @@ function startTunnel() {
 
     const breakdown = getBreakdownIntensity(elapsed);
 
+    // Start glitch SFX when breakdown begins
+    if (breakdown > 0 && !glitchStarted) {
+      glitchStarted = true;
+      glitchAudio.play().catch(() => {});
+    }
+    if (glitchStarted) {
+      glitchAudio.volume = Math.min(breakdown * 1.2, 1);
+      // Fade out main noise as glitch takes over
+      noiseAudio.volume = Math.max(0.5 - breakdown * 0.4, 0.1);
+    }
+
     // Speed increases during breakdown — tunnel accelerates like losing control
-    const speed = BASE_SPEED + breakdown * 160;
+    const speed = BASE_SPEED + breakdown * 220;
 
     camera.position.y += speed * dt;
     if (camera.position.y > TOTAL_HEIGHT) camera.position.y = 0;
 
-    // Camera shake during breakdown
-    const shakeX = breakdown > 0 ? (Math.random() - 0.5) * breakdown * 6 : 0;
-    const shakeZ = breakdown > 0 ? (Math.random() - 0.5) * breakdown * 6 : 0;
+    // Camera shake during breakdown — gets violent
+    const shakeAmt = breakdown * breakdown * 15;
+    const shakeX = breakdown > 0 ? (Math.random() - 0.5) * shakeAmt : 0;
+    const shakeZ = breakdown > 0 ? (Math.random() - 0.5) * shakeAmt : 0;
+    const shakeRoll = breakdown > 0 ? (Math.random() - 0.5) * breakdown * 0.15 : 0;
     camera.position.x = shakeX;
     camera.position.z = shakeZ;
-    camera.lookAt(shakeX * 0.3, camera.position.y + 20, shakeZ * 0.3);
+    camera.lookAt(shakeX * 0.5, camera.position.y + 20, shakeZ * 0.5);
+    camera.rotation.z = shakeRoll;
 
-    // FOV widens as tunnel breaks — feels like being pulled apart
-    camera.fov = 100 + breakdown * 30;
+    // FOV pulses and widens — feels like being pulled apart
+    const fovPulse = breakdown > 0.5 ? Math.sin(elapsed * 12) * breakdown * 10 : 0;
+    camera.fov = 100 + breakdown * 40 + fovPulse;
     camera.updateProjectionMatrix();
+
+    // Rings pulse opacity during breakdown
+    if (breakdown > 0) {
+      ringMat.opacity = 0.12 + Math.sin(elapsed * 8) * breakdown * 0.3;
+    }
 
     // Animate binary sprites — slow drift rotation
     for (let i = 0; i < binarySprites.length; i++) {
@@ -745,6 +771,8 @@ function startTunnel() {
 
       noiseAudio.pause();
       noiseAudio.src = '';
+      glitchAudio.pause();
+      glitchAudio.src = '';
       renderer.dispose();
       geo.dispose();
       ringGeo.dispose();
